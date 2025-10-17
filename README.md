@@ -40,13 +40,12 @@ brew install ffmpeg
 ### 2. Clone and Setup
 
 ```bash
-cd c:/xempre/Projects/musicologo
-python -m venv venv
+python -m venv .venv
 ```
 
 **Activate virtual environment:**
-- Windows: `venv\Scripts\activate`
-- Linux/macOS: `source venv/bin/activate`
+- Windows: `.venv\Scripts\activate`
+- Linux/macOS: `source .venv/bin/activate`
 
 ### 3. Install Dependencies
 
