@@ -5,11 +5,14 @@ A Discord bot that plays and streams audio from YouTube with queue management.
 ## Features
 
 - Stream audio from YouTube URLs or search queries
+- Interactive YouTube search with numbered result selection
 - Queue management system
-- Playback controls (play, pause, resume, skip, stop)
+- Playback controls (play, pause, resume, skip, stop, seek, forward)
 - Volume control
 - Display current song and queue
+- Session persistence and restoration
 - Multi-server support
+- OpenAI integration (optional)
 
 ## Requirements
 
@@ -144,6 +147,9 @@ Type `/` in Discord to see all available commands with descriptions and autocomp
 
 - **/play** - Play audio from YouTube URL or search query
   - Supports YouTube URLs with timestamps (e.g., `?t=90` will start at 1:30)
+- **/search** - Search YouTube and select from top 10 results
+  - Example: `/search mix pop`
+  - Reply with a number (1-10) to select and play a song
 - **/pause** - Pause current playback
 - **/resume** - Resume paused playback
 - **/skip** - Skip to the next song in queue
@@ -170,6 +176,11 @@ All prefix commands use the prefix defined in `.env` (default: `!`)
   - Example: `!play https://www.youtube.com/watch?v=dQw4w9WgXcQ`
   - Example: `!play https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=90` (starts at 1:30)
   - Example: `!play never gonna give you up`
+- **!search <query>** - Search YouTube and select from top 10 results
+  - Aliases: `!s`, `!find`
+  - Example: `!search mix pop`
+  - Reply with a number (1-10) to select and play a song
+  - Search expires after 60 seconds
 - **!pause** - Pause current playback
 - **!resume** - Resume paused playback
 - **!skip** - Skip to the next song in queue

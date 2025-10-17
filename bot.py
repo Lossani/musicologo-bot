@@ -211,12 +211,51 @@ class MusicQueue:
 
 
 music_queues = {}
+search_results = {}
 
 
 def get_queue(guild_id: int) -> MusicQueue:
     if guild_id not in music_queues:
         music_queues[guild_id] = MusicQueue(guild_id)
     return music_queues[guild_id]
+
+
+async def search_youtube(query: str, max_results: int = 10) -> list:
+    """
+    Search YouTube and return a list of results.
+    Returns list of dicts with 'title', 'url', 'duration', 'channel' keys.
+    """
+    loop = asyncio.get_event_loop()
+    try:
+        search_opts = YTDL_OPTIONS.copy()
+        search_opts['extract_flat'] = True
+        search_opts['quiet'] = True
+        
+        def search_sync():
+            with yt_dlp.YoutubeDL(search_opts) as ydl:
+                return ydl.extract_info(f'ytsearch{max_results}:{query}', download=False)
+        
+        data = await loop.run_in_executor(None, search_sync)
+        
+        if not data or 'entries' not in data:
+            return []
+        
+        results = []
+        for entry in data['entries']:
+            if entry:
+                results.append({
+                    'title': entry.get('title', 'Unknown'),
+                    'url': entry.get('url', ''),
+                    'duration': entry.get('duration', 0),
+                    'channel': entry.get('channel', entry.get('uploader', 'Unknown')),
+                    'id': entry.get('id', '')
+                })
+        
+        return results
+    except Exception as e:
+        logger.error(f'YouTube search error: {e}')
+        logger.error(traceback.format_exc())
+        return []
 
 
 async def periodic_state_saver():
@@ -266,6 +305,74 @@ async def on_command_error(ctx, error):
         await ctx.send(f'An error occurred while executing the command.')
 
 
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+    
+    await bot.process_commands(message)
+    
+    if message.author.id in search_results:
+        search_data = search_results[message.author.id]
+        
+        if message.channel.id != search_data['channel_id']:
+            return
+        
+        if time.time() - search_data['timestamp'] > 60:
+            del search_results[message.author.id]
+            return
+        
+        try:
+            selection = int(message.content.strip())
+            if 1 <= selection <= len(search_data['results']):
+                selected = search_data['results'][selection - 1]
+                
+                del search_results[message.author.id]
+                
+                if not message.author.voice:
+                    await message.channel.send('You need to be in a voice channel to play music.')
+                    return
+                
+                voice_channel = message.author.voice.channel
+                queue = get_queue(search_data['guild_id'])
+                guild = bot.get_guild(search_data['guild_id'])
+                voice_client = guild.voice_client if guild else None
+                
+                if voice_client is None:
+                    voice_client = await voice_channel.connect(self_deaf=True)
+                elif voice_client.channel != voice_channel:
+                    await voice_client.move_to(voice_channel)
+                
+                async with message.channel.typing():
+                    try:
+                        video_url = f"https://www.youtube.com/watch?v={selected['id']}"
+                        player = await YTDLSource.from_url(video_url, loop=bot.loop, stream=True)
+                        
+                        if 'ctx' in search_data:
+                            ctx = search_data['ctx']
+                            queue.add({'player': player, 'ctx': ctx, 'original_query': video_url})
+                            
+                            if not voice_client.is_playing():
+                                await play_next(ctx)
+                            else:
+                                await message.channel.send(f'Added to queue: **{player.title}**')
+                        else:
+                            interaction = search_data['interaction']
+                            queue.add({'player': player, 'interaction': interaction, 'original_query': video_url})
+                            
+                            if not voice_client.is_playing():
+                                await play_next_slash(interaction)
+                            else:
+                                await message.channel.send(f'Added to queue: **{player.title}**')
+                        
+                        logger.info(f'User {message.author.id} selected search result {selection}')
+                    except Exception as e:
+                        await message.channel.send(f'An error occurred: {str(e)}')
+                        logger.error(f'Error playing search result: {e}')
+        except ValueError:
+            pass
+
+
 @bot.command(name='play', help='Plays audio from YouTube URL or search query')
 async def play(ctx, *, query: str):
     if not ctx.author.voice:
@@ -292,6 +399,47 @@ async def play(ctx, *, query: str):
                 await ctx.send(f'Added to queue: **{player.title}**')
         except Exception as e:
             await ctx.send(f'An error occurred: {str(e)}')
+
+
+@bot.command(name='search', aliases=['s', 'find'], help='Search YouTube and select from results')
+async def search(ctx, *, query: str):
+    if not ctx.author.voice:
+        await ctx.send('You need to be in a voice channel to use this command.')
+        return
+    
+    async with ctx.typing():
+        results = await search_youtube(query, max_results=10)
+        
+        if not results:
+            await ctx.send('No results found for your search.')
+            return
+        
+        embed = discord.Embed(
+            title=f'Search Results for: {query}',
+            description='Reply with a number (1-10) to select a song',
+            color=discord.Color.blue()
+        )
+        
+        for i, result in enumerate(results, 1):
+            duration_str = format_duration(result['duration']) if result['duration'] else 'Live'
+            embed.add_field(
+                name=f"{i}. {result['title'][:80]}",
+                value=f"Channel: {result['channel']} | Duration: {duration_str}",
+                inline=False
+            )
+        
+        embed.set_footer(text='This search will expire in 60 seconds')
+        await ctx.send(embed=embed)
+        
+        search_results[ctx.author.id] = {
+            'results': results,
+            'channel_id': ctx.channel.id,
+            'guild_id': ctx.guild.id,
+            'timestamp': time.time(),
+            'ctx': ctx
+        }
+        
+        logger.info(f'User {ctx.author.id} searched for: {query}')
 
 
 async def play_next(ctx):
@@ -1211,6 +1359,49 @@ async def slash_restore_session(interaction: discord.Interaction):
             await interaction.followup.send(f'An error occurred while resuming the session: {str(e)}')
         else:
             await interaction.response.send_message(f'An error occurred while resuming the session: {str(e)}', ephemeral=True)
+
+
+@bot.tree.command(name='search', description='Search YouTube and select from results')
+@app_commands.describe(query='Search query for YouTube')
+async def slash_search(interaction: discord.Interaction, query: str):
+    if not interaction.user.voice:
+        await interaction.response.send_message('You need to be in a voice channel to use this command.', ephemeral=True)
+        return
+    
+    await interaction.response.defer()
+    
+    results = await search_youtube(query, max_results=10)
+    
+    if not results:
+        await interaction.followup.send('No results found for your search.')
+        return
+    
+    embed = discord.Embed(
+        title=f'Search Results for: {query}',
+        description='Reply with a number (1-10) to select a song',
+        color=discord.Color.blue()
+    )
+    
+    for i, result in enumerate(results, 1):
+        duration_str = format_duration(result['duration']) if result['duration'] else 'Live'
+        embed.add_field(
+            name=f"{i}. {result['title'][:80]}",
+            value=f"Channel: {result['channel']} | Duration: {duration_str}",
+            inline=False
+        )
+    
+    embed.set_footer(text='This search will expire in 60 seconds')
+    await interaction.followup.send(embed=embed)
+    
+    search_results[interaction.user.id] = {
+        'results': results,
+        'channel_id': interaction.channel.id,
+        'guild_id': interaction.guild.id,
+        'timestamp': time.time(),
+        'interaction': interaction
+    }
+    
+    logger.info(f'User {interaction.user.id} searched for: {query}')
 
 
 def main():
