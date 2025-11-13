@@ -70,18 +70,31 @@ FFMPEG_OPTIONS = {
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 
+MIN_PLAYBACK_SPEED = 0.5
+MAX_PLAYBACK_SPEED = 2.0
+PLAYBACK_SPEED_TOLERANCE = 0.005
+
 
 class YTDLSource(discord.PCMVolumeTransformer):
-    def __init__(self, source, *, data, volume=0.69, start_time=0):
+    def __init__(self, source, *, data, volume=0.69, start_time=0, playback_speed=1.0):
         super().__init__(source, volume)
         self.data = data
         self.title = data.get('title')
         self.url = data.get('url')
         self.duration = data.get('duration')
         self.start_time = start_time
+        self.playback_speed = playback_speed
 
     @classmethod
-    async def from_url(cls, url, *, loop=None, stream=True, start_time=0):
+    async def from_url(
+        cls,
+        url,
+        *,
+        loop=None,
+        stream=True,
+        start_time=0,
+        playback_speed=1.0
+    ):
         loop = loop or asyncio.get_event_loop()
         data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
 
@@ -93,8 +106,17 @@ class YTDLSource(discord.PCMVolumeTransformer):
         ffmpeg_options = FFMPEG_OPTIONS.copy()
         if start_time > 0:
             ffmpeg_options['before_options'] = f'-ss {start_time} ' + ffmpeg_options.get('before_options', '')
-        
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data, start_time=start_time)
+        if abs(playback_speed - 1.0) > PLAYBACK_SPEED_TOLERANCE:
+            speed_value = f'{playback_speed:.3f}'.rstrip('0').rstrip('.')
+            options = ffmpeg_options.get('options', '').strip()
+            ffmpeg_options['options'] = f"{options} -af atempo={speed_value}".strip()
+
+        return cls(
+            discord.FFmpegPCMAudio(filename, **ffmpeg_options),
+            data=data,
+            start_time=start_time,
+            playback_speed=playback_speed
+        )
 
     @classmethod
     def extract_start_time(cls, url: str) -> int:
@@ -119,6 +141,7 @@ class MusicQueue:
         self.queue = []
         self.current = None
         self.playback_start_time = None
+        self.playback_speed = 1.0
 
     def add(self, item):
         self.queue.append(item)
@@ -135,6 +158,7 @@ class MusicQueue:
         self.queue.clear()
         self.current = None
         self.playback_start_time = None
+        self.playback_speed = 1.0
         if save_state:
             self.save_state()
 
@@ -144,13 +168,20 @@ class MusicQueue:
     def get_current_position(self) -> int:
         """Get current playback position in seconds"""
         if self.current and self.playback_start_time:
-            player = self.current['player']
-            elapsed = int(time.time() - self.playback_start_time)
-            return player.start_time + elapsed
+            player = self.current.get('player')
+            if not player:
+                return 0
+            elapsed = time.time() - self.playback_start_time
+            progress = player.start_time + (elapsed * player.playback_speed)
+            return int(progress)
         return 0
     
     def start_playback(self):
         """Mark the start of playback for position tracking"""
+        if self.current:
+            player = self.current.get('player')
+            if player:
+                self.playback_speed = player.playback_speed
         self.playback_start_time = time.time()
         self.save_state()
     
@@ -158,29 +189,50 @@ class MusicQueue:
         """Serialize queue state to dictionary"""
         queue_data = []
         for item in self.queue:
-            player = item['player']
+            player = item.get('player')
+            if not player:
+                continue
             queue_data.append({
                 'title': player.title,
                 'original_query': item.get('original_query', player.title),
                 'duration': player.duration,
-                'start_time': player.start_time
+                'start_time': player.start_time,
+                'playback_speed': player.playback_speed
             })
         
         current_data = None
         if self.current:
-            player = self.current['player']
-            current_data = {
-                'title': player.title,
-                'original_query': self.current.get('original_query', player.title),
-                'duration': player.duration,
-                'position': self.get_current_position()
-            }
+            player = self.current.get('player')
+            if player:
+                current_data = {
+                    'title': player.title,
+                    'original_query': self.current.get('original_query', player.title),
+                    'duration': player.duration,
+                    'position': self.get_current_position(),
+                    'playback_speed': player.playback_speed
+                }
+        
+        current_volume = None
+        if self.current:
+            ctx_reference = self.current.get('ctx')
+            if ctx_reference and ctx_reference.voice_client and ctx_reference.voice_client.source:
+                current_volume = ctx_reference.voice_client.source.volume
+            else:
+                interaction_ref = self.current.get('interaction')
+                if (
+                    interaction_ref
+                    and interaction_ref.guild
+                    and interaction_ref.guild.voice_client
+                    and interaction_ref.guild.voice_client.source
+                ):
+                    current_volume = interaction_ref.guild.voice_client.source.volume
         
         return {
             'guild_id': self.guild_id,
             'queue': queue_data,
             'current': current_data,
-            'current_volume': self.current['ctx'].voice_client.source.volume if self.current and self.current['ctx'] and self.current['ctx'].voice_client and self.current['ctx'].voice_client.source else None,
+            'current_volume': current_volume,
+            'playback_speed': self.playback_speed,
             'timestamp': time.time()
         }
     
@@ -346,7 +398,12 @@ async def on_message(message):
                 async with message.channel.typing():
                     try:
                         video_url = f"https://www.youtube.com/watch?v={selected['id']}"
-                        player = await YTDLSource.from_url(video_url, loop=bot.loop, stream=True)
+                        player = await YTDLSource.from_url(
+                            video_url,
+                            loop=bot.loop,
+                            stream=True,
+                            playback_speed=queue.playback_speed
+                        )
                         
                         if 'ctx' in search_data:
                             ctx = search_data['ctx']
@@ -390,7 +447,13 @@ async def play(ctx, *, query: str):
     async with ctx.typing():
         try:
             start_time = YTDLSource.extract_start_time(query)
-            player = await YTDLSource.from_url(query, loop=bot.loop, stream=True, start_time=start_time)
+            player = await YTDLSource.from_url(
+                query,
+                loop=bot.loop,
+                stream=True,
+                start_time=start_time,
+                playback_speed=queue.playback_speed
+            )
             queue.add({'player': player, 'ctx': ctx, 'original_query': query})
 
             if not ctx.voice_client.is_playing():
@@ -637,7 +700,12 @@ async def restore_session(ctx):
     if not saved_state:
         await ctx.send('No saved session found for this server.')
         return
-    
+
+    queue.playback_speed = saved_state.get('playback_speed', 1.0)
+    logger.info(
+        f'Restoring session for guild {ctx.guild.id} with speed {queue.playback_speed}x'
+    )
+
     if not saved_state.get('current') and not saved_state.get('queue'):
         await ctx.send('Saved session is empty.')
         return
@@ -656,11 +724,13 @@ async def restore_session(ctx):
                 logger.info(f'Resuming: {current["title"]} at position {current.get("position", 0)}s')
                 
                 position = current.get('position', 0)
+                playback_speed = current.get('playback_speed', queue.playback_speed)
                 player = await YTDLSource.from_url(
                     current['original_query'],
                     loop=bot.loop,
                     stream=True,
-                    start_time=position
+                    start_time=position,
+                    playback_speed=playback_speed
                 )
                 queue.current = {'player': player, 'ctx': ctx, 'original_query': current['original_query']}
                 
@@ -687,7 +757,8 @@ async def restore_session(ctx):
                         item['original_query'],
                         loop=bot.loop,
                         stream=True,
-                        start_time=item.get('start_time', 0)
+                        start_time=item.get('start_time', 0),
+                        playback_speed=item.get('playback_speed', queue.playback_speed)
                     )
                     queue.add({'player': player, 'ctx': ctx, 'original_query': item['original_query']})
                     restored_count += 1
@@ -767,23 +838,32 @@ async def seek(ctx, *, time: str):
         
         async with ctx.typing():
             original_query = queue.current.get('original_query', player_data.title)
+            current_source = ctx.voice_client.source
+            current_volume = getattr(current_source, 'volume', None) if current_source else None
             ctx.voice_client.stop()
             
             new_player = await YTDLSource.from_url(
-                original_query, 
-                loop=bot.loop, 
-                stream=True, 
-                start_time=seek_seconds
+                original_query,
+                loop=bot.loop,
+                stream=True,
+                start_time=seek_seconds,
+                playback_speed=player_data.playback_speed
             )
             
-            queue.current = {'player': new_player, 'ctx': ctx, 'original_query': original_query}
+            metadata = dict(queue.current)
+            metadata['player'] = new_player
+            metadata['ctx'] = ctx
+            metadata['original_query'] = original_query
+            queue.current = metadata
             
             def after_playing(error):
                 if error:
-                    print(f'Player error: {error}')
+                    logger.error(f'Player error in guild {ctx.guild.id}: {error}')
                 asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
             
             ctx.voice_client.play(new_player, after=after_playing)
+            if current_volume is not None:
+                new_player.volume = current_volume
             queue.start_playback()
             logger.info(f'Guild {ctx.guild.id} seeked to {seek_seconds}s')
             await ctx.send(f'Seeked to {format_duration(seek_seconds)} in **{new_player.title}**')
@@ -821,31 +901,121 @@ async def forward(ctx, seconds: int):
         
         async with ctx.typing():
             original_query = queue.current.get('original_query', player_data.title)
+            current_source = ctx.voice_client.source
+            current_volume = getattr(current_source, 'volume', None) if current_source else None
             ctx.voice_client.stop()
             
             new_player = await YTDLSource.from_url(
-                original_query, 
-                loop=bot.loop, 
-                stream=True, 
-                start_time=new_position
+                original_query,
+                loop=bot.loop,
+                stream=True,
+                start_time=new_position,
+                playback_speed=player_data.playback_speed
             )
             
-            queue.current = {'player': new_player, 'ctx': ctx, 'original_query': original_query}
+            metadata = dict(queue.current)
+            metadata['player'] = new_player
+            metadata['ctx'] = ctx
+            metadata['original_query'] = original_query
+            queue.current = metadata
             
             def after_playing(error):
                 if error:
-                    print(f'Player error: {error}')
+                    logger.error(f'Player error in guild {ctx.guild.id}: {error}')
                 asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
             
             ctx.voice_client.play(new_player, after=after_playing)
+            if current_volume is not None:
+                new_player.volume = current_volume
             queue.start_playback()
             
             direction = 'forward' if seconds > 0 else 'backward'
-            logger.info(f'Guild {ctx.guild.id} skipped {direction} {seconds}s to position {new_position}s')
-            await ctx.send(f'Skipped {direction} {abs(seconds)}s to {format_duration(new_position)} in **{new_player.title}**')
-            
+            logger.info(
+                f'Guild {ctx.guild.id} skipped {direction} {seconds}s to position {new_position}s'
+            )
+            await ctx.send(
+                f'Skipped {direction} {abs(seconds)}s to {format_duration(new_position)} '
+                f'in **{new_player.title}**'
+            )
     except Exception as e:
         await ctx.send(f'An error occurred while skipping: {str(e)}')
+
+
+@bot.command(name='speed', aliases=['tempo'], help='Change playback speed (0.5x-2.0x)')
+async def change_speed(ctx, speed: float):
+    queue = get_queue(ctx.guild.id)
+    if queue.current is None:
+        await ctx.send('Nothing is currently playing.')
+        return
+
+    voice_client = ctx.voice_client
+    if not voice_client or not voice_client.is_connected():
+        await ctx.send('I am not in a voice channel.')
+        return
+
+    if not MIN_PLAYBACK_SPEED <= speed <= MAX_PLAYBACK_SPEED:
+        await ctx.send(
+            f'Playback speed must be between {MIN_PLAYBACK_SPEED}x and {MAX_PLAYBACK_SPEED}x.'
+        )
+        return
+
+    current_item = queue.current
+    current_player = current_item.get('player') if current_item else None
+    if not current_player:
+        await ctx.send('Playback data is not available.')
+        return
+
+    if abs(current_player.playback_speed - speed) <= PLAYBACK_SPEED_TOLERANCE:
+        await ctx.send(f'Playback speed is already {format_speed(speed)}x.')
+        return
+
+    async with ctx.typing():
+        try:
+            original_query = current_item.get('original_query', current_player.title)
+            current_position = queue.get_current_position()
+            if current_player.duration and current_position >= current_player.duration:
+                current_position = max(current_player.duration - 1, 0)
+
+            current_source = voice_client.source
+            current_volume = getattr(current_source, 'volume', None) if current_source else None
+            voice_client.stop()
+
+            new_player = await YTDLSource.from_url(
+                original_query,
+                loop=bot.loop,
+                stream=True,
+                start_time=current_position,
+                playback_speed=speed
+            )
+
+            metadata = dict(current_item)
+            metadata['player'] = new_player
+            metadata['ctx'] = ctx
+            metadata['original_query'] = original_query
+            queue.current = metadata
+
+            def after_playing(error):
+                if error:
+                    logger.error(f'Player error in guild {ctx.guild.id}: {error}')
+                    logger.error(traceback.format_exc())
+                try:
+                    asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
+                except Exception as exc:
+                    logger.error(f'Failed to queue next song: {exc}')
+
+            voice_client.play(new_player, after=after_playing)
+            if current_volume is not None:
+                new_player.volume = current_volume
+            queue.start_playback()
+
+            await ctx.send(
+                f'Playback speed set to {format_speed(speed)}x at '
+                f'{format_duration(current_position)} in **{new_player.title}**'
+            )
+        except Exception as e:
+            logger.error(f'Error changing playback speed in guild {ctx.guild.id}: {e}')
+            logger.error(traceback.format_exc())
+            await ctx.send(f'An error occurred while changing playback speed: {str(e)}')
 
 
 def parse_time_input(time_str: str) -> int:
@@ -877,6 +1047,11 @@ def format_duration(seconds: int) -> str:
         return f'{int(hours)}:{int(minutes):02d}:{int(secs):02d}'
 
 
+def format_speed(speed: float) -> str:
+    value = f'{speed:.2f}'
+    return value.rstrip('0').rstrip('.')
+
+
 # Slash Commands
 @bot.tree.command(name='play', description='Play audio from YouTube URL or search query')
 @app_commands.describe(query='YouTube URL or search query')
@@ -899,7 +1074,13 @@ async def slash_play(interaction: discord.Interaction, query: str):
     
     try:
         start_time = YTDLSource.extract_start_time(query)
-        player = await YTDLSource.from_url(query, loop=bot.loop, stream=True, start_time=start_time)
+        player = await YTDLSource.from_url(
+            query,
+            loop=bot.loop,
+            stream=True,
+            start_time=start_time,
+            playback_speed=queue.playback_speed
+        )
         queue.add({'player': player, 'interaction': interaction, 'original_query': query})
 
         if not voice_client.is_playing():
@@ -1109,22 +1290,33 @@ async def slash_seek(interaction: discord.Interaction, time: str):
         voice_client.stop()
         
         new_player = await YTDLSource.from_url(
-            original_query, 
-            loop=bot.loop, 
-            stream=True, 
-            start_time=seek_seconds
+            original_query,
+            loop=bot.loop,
+            stream=True,
+            start_time=seek_seconds,
+            playback_speed=player_data.playback_speed
         )
         
-        queue.current = {'player': new_player, 'interaction': interaction, 'original_query': original_query}
+        metadata = dict(queue.current)
+        metadata['player'] = new_player
+        metadata['interaction'] = interaction
+        metadata['original_query'] = original_query
+        queue.current = metadata
         
         def after_playing(error):
             if error:
-                print(f'Player error: {error}')
+                logger.error(f'Player error in guild {interaction.guild.id}: {error}')
             asyncio.run_coroutine_threadsafe(play_next_slash(interaction), bot.loop)
         
+        current_source = voice_client.source
+        current_volume = getattr(current_source, 'volume', None) if current_source else None
         voice_client.play(new_player, after=after_playing)
+        if current_volume is not None:
+            new_player.volume = current_volume
         queue.start_playback()
-        await interaction.followup.send(f'Seeked to {format_duration(seek_seconds)} in **{new_player.title}**')
+        await interaction.followup.send(
+            f'Seeked to {format_duration(seek_seconds)} in **{new_player.title}**'
+        )
         
     except ValueError:
         await interaction.response.send_message(
@@ -1173,30 +1365,126 @@ async def slash_forward(interaction: discord.Interaction, seconds: int):
         voice_client.stop()
         
         new_player = await YTDLSource.from_url(
-            original_query, 
-            loop=bot.loop, 
-            stream=True, 
-            start_time=new_position
+            original_query,
+            loop=bot.loop,
+            stream=True,
+            start_time=new_position,
+            playback_speed=player_data.playback_speed
         )
         
-        queue.current = {'player': new_player, 'interaction': interaction, 'original_query': original_query}
+        metadata = dict(queue.current)
+        metadata['player'] = new_player
+        metadata['interaction'] = interaction
+        metadata['original_query'] = original_query
+        queue.current = metadata
         
         def after_playing(error):
             if error:
-                print(f'Player error: {error}')
+                logger.error(f'Player error in guild {interaction.guild.id}: {error}')
             asyncio.run_coroutine_threadsafe(play_next_slash(interaction), bot.loop)
         
+        current_source = voice_client.source
+        current_volume = getattr(current_source, 'volume', None) if current_source else None
         voice_client.play(new_player, after=after_playing)
+        if current_volume is not None:
+            new_player.volume = current_volume
         queue.start_playback()
         
         direction = 'forward' if seconds > 0 else 'backward'
-        await interaction.followup.send(f'Skipped {direction} {abs(seconds)}s to {format_duration(new_position)} in **{new_player.title}**')
+        await interaction.followup.send(
+            f'Skipped {direction} {abs(seconds)}s to {format_duration(new_position)} '
+            f'in **{new_player.title}**'
+        )
         
     except Exception as e:
         if interaction.response.is_done():
             await interaction.followup.send(f'An error occurred while skipping: {str(e)}')
         else:
             await interaction.response.send_message(f'An error occurred while skipping: {str(e)}', ephemeral=True)
+
+
+@bot.tree.command(name='speed', description='Change playback speed (0.5x-2.0x)')
+@app_commands.describe(speed='Playback speed multiplier between 0.5x and 2.0x')
+async def slash_speed(interaction: discord.Interaction, speed: float):
+    queue = get_queue(interaction.guild.id)
+    if queue.current is None:
+        await interaction.response.send_message('Nothing is currently playing.', ephemeral=True)
+        return
+
+    voice_client = interaction.guild.voice_client
+    if not voice_client or not voice_client.is_connected():
+        await interaction.response.send_message('I am not in a voice channel.', ephemeral=True)
+        return
+
+    if not MIN_PLAYBACK_SPEED <= speed <= MAX_PLAYBACK_SPEED:
+        await interaction.response.send_message(
+            f'Playback speed must be between {MIN_PLAYBACK_SPEED}x and {MAX_PLAYBACK_SPEED}x.',
+            ephemeral=True
+        )
+        return
+
+    current_item = queue.current
+    current_player = current_item.get('player') if current_item else None
+    if not current_player:
+        await interaction.response.send_message('Playback data is not available.', ephemeral=True)
+        return
+
+    if abs(current_player.playback_speed - speed) <= PLAYBACK_SPEED_TOLERANCE:
+        await interaction.response.send_message(
+            f'Playback speed is already {format_speed(speed)}x.',
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+    try:
+        original_query = current_item.get('original_query', current_player.title)
+        current_position = queue.get_current_position()
+        if current_player.duration and current_position >= current_player.duration:
+            current_position = max(current_player.duration - 1, 0)
+
+        current_source = voice_client.source
+        current_volume = getattr(current_source, 'volume', None) if current_source else None
+        voice_client.stop()
+
+        new_player = await YTDLSource.from_url(
+            original_query,
+            loop=bot.loop,
+            stream=True,
+            start_time=current_position,
+            playback_speed=speed
+        )
+
+        metadata = dict(current_item)
+        metadata['player'] = new_player
+        metadata['interaction'] = interaction
+        metadata['original_query'] = original_query
+        queue.current = metadata
+
+        def after_playing(error):
+            if error:
+                logger.error(f'Player error in guild {interaction.guild.id}: {error}')
+                logger.error(traceback.format_exc())
+            try:
+                asyncio.run_coroutine_threadsafe(play_next_slash(interaction), bot.loop)
+            except Exception as exc:
+                logger.error(f'Failed to queue next song: {exc}')
+
+        voice_client.play(new_player, after=after_playing)
+        if current_volume is not None:
+            new_player.volume = current_volume
+        queue.start_playback()
+
+        await interaction.followup.send(
+            f'Playback speed set to {format_speed(speed)}x at '
+            f'{format_duration(current_position)} in **{new_player.title}**'
+        )
+    except Exception as e:
+        logger.error(f'Error changing playback speed in guild {interaction.guild.id}: {e}')
+        logger.error(traceback.format_exc())
+        await interaction.followup.send(
+            f'An error occurred while changing playback speed: {str(e)}'
+        )
 
 
 @bot.tree.command(name='status', description='Check bot status and connection health')
@@ -1288,7 +1576,12 @@ async def slash_restore_session(interaction: discord.Interaction):
     if not saved_state:
         await interaction.response.send_message('No saved session found for this server.', ephemeral=True)
         return
-    
+
+    queue.playback_speed = saved_state.get('playback_speed', 1.0)
+    logger.info(
+        f'Restoring session for guild {interaction.guild.id} with speed {queue.playback_speed}x'
+    )
+
     if not saved_state.get('current') and not saved_state.get('queue'):
         await interaction.response.send_message('Saved session is empty.', ephemeral=True)
         return
@@ -1309,11 +1602,13 @@ async def slash_restore_session(interaction: discord.Interaction):
             logger.info(f'Resuming: {current["title"]} at position {current.get("position", 0)}s')
             
             position = current.get('position', 0)
+            playback_speed = current.get('playback_speed', queue.playback_speed)
             player = await YTDLSource.from_url(
                 current['original_query'],
                 loop=bot.loop,
                 stream=True,
-                start_time=position
+                start_time=position,
+                playback_speed=playback_speed
             )
             queue.current = {'player': player, 'interaction': interaction, 'original_query': current['original_query']}
             
@@ -1340,7 +1635,8 @@ async def slash_restore_session(interaction: discord.Interaction):
                     item['original_query'],
                     loop=bot.loop,
                     stream=True,
-                    start_time=item.get('start_time', 0)
+                    start_time=item.get('start_time', 0),
+                    playback_speed=item.get('playback_speed', queue.playback_speed)
                 )
                 queue.add({'player': player, 'interaction': interaction, 'original_query': item['original_query']})
                 restored_count += 1
